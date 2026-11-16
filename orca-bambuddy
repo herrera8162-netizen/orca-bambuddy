@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Install the newest Orca Slicer for Mac, patched so prints sent to Bambu printers
+# (and Bambuddy) keep the model geometry.
+#
+# Usage: orca-bambuddy [--stable] [--force]
+#   default   newest release including betas/RCs
+#   --stable  newest stable release only
+#   --force   reinstall even if that version is already installed patched
+set -euo pipefail
+
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+app=/Applications/OrcaSlicer.app
+state="$HOME/.local/state/orca-bambuddy"
+stable=false force=false
+for arg in "$@"; do
+  case "$arg" in
+    --stable) stable=true ;;
+    --force) force=true ;;
+    *) echo "unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
+
+filter='[.[] | select(.draft | not) | select(.tag_name | startswith("v"))'
+[[ "$stable" == true ]] && filter+=' | select(.prerelease | not)'
+filter+='] | sort_by(.published_at) | last'
+release=$(curl -fsSL "https://api.github.com/repos/OrcaSlicer/OrcaSlicer/releases?per_page=30" | jq "$filter")
+tag=$(jq -r .tag_name <<<"$release")
+url=$(jq -r '.assets[] | select(.name | test("Mac_universal.*\\.dmg$")) | .browser_download_url' <<<"$release")
+[[ -n "$url" ]] || { echo "No Mac dmg in Orca $tag" >&2; exit 1; }
+
+mkdir -p "$state"
+if [[ "$force" != true && -d "$app" && "$(cat "$state/installed" 2>/dev/null)" == "$tag" ]]; then
+  echo "Orca $tag (patched) is already installed."
+  exit 0
+fi
+
+work=$(mktemp -d)
+mnt="$work/mnt"
+cleanup() { hdiutil detach -quiet "$mnt" 2>/dev/null || true; rm -rf "$work"; }
+trap cleanup EXIT
+
+echo "Downloading Orca ${tag}…"
+curl -fL --progress-bar -o "$work/orca.dmg" "$url"
+hdiutil attach -quiet -nobrowse -readonly -mountpoint "$mnt" "$work/orca.dmg"
+ditto "$mnt/OrcaSlicer.app" "$work/OrcaSlicer.app"
+python3 -I "$here/patch_orca.py" "$work/OrcaSlicer.app"
+
+if pgrep -xq OrcaSlicer; then
+  echo "Quitting Orca…"
+  osascript -e 'quit app "OrcaSlicer"'
+  for _ in {1..30}; do pgrep -xq OrcaSlicer || break; sleep 1; done
+  pgrep -xq OrcaSlicer && { echo "Orca is still running; close it and rerun." >&2; exit 1; }
+fi
+
+[[ -d "$app" ]] && mv "$app" "$work/old.app"
+ditto "$work/OrcaSlicer.app" "$app"
+echo "$tag" > "$state/installed"
+echo "Installed patched Orca $tag in $app"
